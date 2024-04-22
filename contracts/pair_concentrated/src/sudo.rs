@@ -1,4 +1,4 @@
-use astroport::asset::{native_asset_info, AssetInfo, AssetInfoExt};
+use astroport::asset::{native_asset_info, AssetInfo, AssetInfoExt, DecimalAsset};
 use astroport::cosmwasm_ext::{DecimalToInteger, IntegerToDecimal};
 use astroport::observation::PrecommitObservation;
 use astroport::pair::MIN_TRADE_SIZE;
@@ -8,8 +8,8 @@ use astroport_pcl_common::utils::{compute_offer_amount, compute_swap};
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    attr, ensure, to_json_binary, Coin, Decimal, Decimal256, DepsMut, Env, Response, StdError,
-    Uint128,
+    attr, coins, ensure, to_json_binary, BankMsg, Coin, CosmosMsg, Decimal, Decimal256, DepsMut,
+    Env, Response, StdError, Uint128,
 };
 
 use astroport_on_osmosis::pair_pcl::{SudoMessage, SwapExactAmountOutResponseData};
@@ -17,7 +17,7 @@ use astroport_on_osmosis::pair_pcl::{SudoMessage, SwapExactAmountOutResponseData
 use crate::contract::{internal_swap, LP_TOKEN_PRECISION};
 use crate::error::ContractError;
 use crate::state::{BALANCES, CONFIG, SWAP_PARAMS};
-use crate::utils::{accumulate_swap_sizes, query_native_supply};
+use crate::utils::{accumulate_swap_sizes, calculate_tax, query_native_supply};
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn sudo(deps: DepsMut, env: Env, msg: SudoMessage) -> Result<Response, ContractError> {
@@ -112,10 +112,38 @@ fn swap_exact_amount_out(
     let offer_ind = pools
         .iter()
         .position(|asset| asset.info == AssetInfo::native(&token_in_denom))
-        .ok_or(ContractError::InvalidAsset(token_in_denom))?;
+        .ok_or(ContractError::InvalidAsset(token_in_denom.to_owned()))?;
     let offer_asset_prec = precisions.get_precision(&pools[offer_ind].info)?;
 
-    // Offer pool must have token_in_max_amount in it. We need to subtract it from the pool balance
+    let tax_config = config
+        .tax_configs
+        .as_ref()
+        .and_then(|configs| configs.get(&token_in_denom));
+
+    let (token_in_max_amount, sales_tax_bank_msg) = {
+        let base_dec = DecimalAsset {
+            info: AssetInfo::NativeToken {
+                denom: token_in_denom.to_owned(),
+            },
+            amount: Decimal256::raw(token_in_max_amount.u128()),
+        };
+        if let Some(tax) = tax_config {
+            let sales_tax_amount = calculate_tax(&tax_config, base_dec.amount)?;
+            (
+                (base_dec.amount - sales_tax_amount).to_uint(offer_asset_prec)?,
+                Some(BankMsg::Send {
+                    to_address: tax.tax_recipient.to_string(),
+                    amount: coins(
+                        sales_tax_amount.to_uint(offer_asset_prec)?.u128(),
+                        token_in_denom,
+                    ),
+                }),
+            )
+        } else {
+            (base_dec.amount.to_uint(offer_asset_prec)?, None)
+        }
+    };
+
     pools[offer_ind].amount -= token_in_max_amount;
 
     let mut xs = pools
@@ -188,10 +216,20 @@ fn swap_exact_amount_out(
             .update_price(&config.pool_params, &env, total_share, &xs, last_price)?;
     }
 
-    let mut messages = vec![pools[ask_ind]
-        .info
-        .with_balance(return_amount)
-        .into_msg(&sender)?];
+    let mut messages: Vec<CosmosMsg> = if let Some(tax_msg) = sales_tax_bank_msg {
+        vec![
+            tax_msg.into(),
+            pools[ask_ind]
+                .info
+                .with_balance(return_amount)
+                .into_msg(&sender)?,
+        ]
+    } else {
+        vec![pools[ask_ind]
+            .info
+            .with_balance(return_amount)
+            .into_msg(&sender)?]
+    };
 
     let mut maker_fee = Uint128::zero();
     if let Some(fee_address) = fee_info.fee_address {

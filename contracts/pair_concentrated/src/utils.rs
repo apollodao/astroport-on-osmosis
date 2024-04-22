@@ -2,10 +2,11 @@ use astroport::asset::{Asset, DecimalAsset};
 use astroport::observation::{
     safe_sma_buffer_not_full, safe_sma_calculation, Observation, PrecommitObservation,
 };
+use astroport::pair_xyk_sale_tax::TaxConfig;
 use astroport_circular_buffer::error::BufferResult;
 use astroport_circular_buffer::BufferManager;
 use astroport_pcl_common::state::{Config, Precisions};
-use cosmwasm_std::{Addr, Decimal, Env, QuerierWrapper, StdResult, Storage, Uint128};
+use cosmwasm_std::{Addr, Decimal, Decimal256, Env, QuerierWrapper, StdResult, Storage, Uint128};
 
 use crate::error::ContractError;
 use crate::state::OBSERVATIONS;
@@ -106,6 +107,18 @@ pub fn query_native_supply(querier: &QuerierWrapper, contract_addr: &Addr) -> St
     querier
         .query_supply(contract_addr.as_str())
         .map(|res| res.amount)
+}
+
+pub fn calculate_tax(
+    tax_config: &Option<&TaxConfig<Addr>>,
+    offer_asset_amount: Decimal256,
+) -> StdResult<Decimal256> {
+    if let Some(tax) = tax_config {
+        let sales_tax_amount = offer_asset_amount * Decimal256::from(tax.tax_rate);
+        Ok(sales_tax_amount)
+    } else {
+        Ok(Decimal256::zero())
+    }
 }
 
 #[cfg(test)]

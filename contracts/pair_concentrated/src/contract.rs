@@ -1,10 +1,10 @@
 use std::vec;
 
-use astroport::asset::AssetInfoExt;
 use astroport::asset::{
     addr_opt_validate, Asset, AssetInfo, CoinsExt, Decimal256Ext, PairInfo,
     MINIMUM_LIQUIDITY_AMOUNT,
 };
+use astroport::asset::{AssetInfoExt, DecimalAsset};
 use astroport::common::{claim_ownership, drop_ownership_proposal, propose_new_owner};
 use astroport::cosmwasm_ext::{AbsDiff, DecimalToInteger, IntegerToDecimal};
 use astroport::factory::PairType;
@@ -13,6 +13,7 @@ use astroport::pair::{InstantiateMsg, MIN_TRADE_SIZE};
 use astroport::pair_concentrated::{
     ConcentratedPoolParams, ConcentratedPoolUpdateParams, UpdatePoolParams,
 };
+use astroport::pair_xyk_sale_tax::SaleTaxInitParams;
 use astroport::querier::{query_factory_config, query_fee_info};
 use astroport_circular_buffer::BufferManager;
 use astroport_pcl_common::state::{
@@ -26,8 +27,9 @@ use astroport_pcl_common::{calc_d, get_xcp};
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    attr, coin, ensure, from_json, to_json_binary, Addr, Binary, Decimal, Decimal256, DepsMut,
-    Empty, Env, MessageInfo, Reply, Response, StdError, StdResult, SubMsg, Uint128,
+    attr, coin, coins, ensure, from_json, to_json_binary, Addr, BankMsg, Binary, CosmosMsg,
+    Decimal, Decimal256, DepsMut, Empty, Env, MessageInfo, Reply, Response, StdError, StdResult,
+    SubMsg, Uint128,
 };
 use cw2::set_contract_version;
 use cw_utils::must_pay;
@@ -43,7 +45,7 @@ use crate::error::ContractError;
 use crate::state::{
     SwapParams, BALANCES, CONFIG, OBSERVATIONS, OWNERSHIP_PROPOSAL, POOL_ID, SWAP_PARAMS,
 };
-use crate::utils::{accumulate_swap_sizes, query_native_supply, query_pools};
+use crate::utils::{accumulate_swap_sizes, calculate_tax, query_native_supply, query_pools};
 
 /// Contract name that is used for migration.
 const CONTRACT_NAME: &str = env!("CARGO_PKG_NAME");
@@ -93,12 +95,15 @@ pub fn instantiate(
 
     let params: ConcentratedPoolParams = from_json(
         msg.init_params
+            .as_ref()
             .ok_or(ContractError::InitParamsNotFound {})?,
     )?;
     ensure!(
         !params.price_scale.is_zero(),
         StdError::generic_err("Initial price scale can not be zero")
     );
+
+    let sales_tax_init_params = SaleTaxInitParams::from_json(msg.init_params.clone())?;
 
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
@@ -141,7 +146,7 @@ pub fn instantiate(
         pair_info: PairInfo {
             contract_addr: env.contract.address.clone(),
             liquidity_token: Addr::unchecked(""),
-            asset_infos: msg.asset_infos,
+            asset_infos: msg.asset_infos.to_owned(),
             pair_type: PairType::Custom("concentrated".to_string()),
         },
         factory_addr,
@@ -150,6 +155,15 @@ pub fn instantiate(
         owner: None,
         track_asset_balances: params.track_asset_balances.unwrap_or_default(),
         fee_share: None,
+        tax_configs: Some(
+            sales_tax_init_params
+                .tax_configs
+                .check(deps.api, &msg.asset_infos)?,
+        ),
+        tax_config_admin: Some(
+            deps.api
+                .addr_validate(&sales_tax_init_params.tax_config_admin)?,
+        ),
     };
 
     if config.track_asset_balances {
@@ -678,8 +692,33 @@ pub fn internal_swap(
 ) -> Result<Response, ContractError> {
     let precisions = Precisions::new(deps.storage)?;
     let offer_asset_prec = precisions.get_precision(&offer_asset.info)?;
-    let offer_asset_dec = offer_asset.to_decimal_asset(offer_asset_prec)?;
     let mut config = CONFIG.load(deps.storage)?;
+
+    let tax_config = config
+        .tax_configs
+        .as_ref()
+        .and_then(|configs| configs.get(&offer_asset.info.to_string()));
+
+    let tax = calculate_tax(
+        &tax_config,
+        offer_asset.to_decimal_asset(offer_asset_prec)?.amount,
+    )?;
+    let offer_asset_dec = DecimalAsset {
+        info: offer_asset.info.to_owned(),
+        amount: Decimal256::raw(offer_asset.amount.u128()) - tax,
+    };
+
+    let sales_tax_bank_msg = if tax.is_zero() {
+        None
+    } else {
+        Some(BankMsg::Send {
+            to_address: tax_config.expect("Tax Config Recipient Not Set.").tax_recipient.to_string(), // It's safe to unwrap here because the sales tax will never be greater than 0 if there's no TaxConfig
+            amount: coins(
+                tax.to_uint128_with_precision(offer_asset_prec)?.u128(),
+                offer_asset.info.to_string(),
+            ),
+        })
+    };
 
     let mut pools = query_pools(deps.querier, &env.contract.address, &config, &precisions)?;
 
@@ -749,10 +788,20 @@ pub fn internal_swap(
 
     let receiver = to.unwrap_or_else(|| sender.clone());
 
-    let mut messages = vec![pools[ask_ind]
-        .info
-        .with_balance(return_amount)
-        .into_msg(&receiver)?];
+    let mut messages: Vec<CosmosMsg> = if let Some(tax_msg) = sales_tax_bank_msg {
+        vec![
+            tax_msg.into(),
+            pools[ask_ind]
+                .info
+                .with_balance(return_amount)
+                .into_msg(&receiver)?,
+        ]
+    } else {
+        vec![pools[ask_ind]
+            .info
+            .with_balance(return_amount)
+            .into_msg(&receiver)?]
+    };
 
     let mut maker_fee = Uint128::zero();
     if let Some(fee_address) = fee_info.fee_address {

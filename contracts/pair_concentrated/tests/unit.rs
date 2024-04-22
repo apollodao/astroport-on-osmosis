@@ -37,6 +37,8 @@ fn test_replies() {
         owner: None,
         track_asset_balances: false,
         fee_share: None,
+        tax_config_admin: None,
+        tax_configs: None,
     };
     CONFIG.save(deps.as_mut().storage, &config).unwrap();
 

@@ -1,4 +1,6 @@
-use astroport::asset::{native_asset_info, Asset, AssetInfo, AssetInfoExt};
+use astroport::asset::{
+    native_asset_info, Asset, AssetInfo, AssetInfoExt, Decimal256Ext, DecimalAsset,
+};
 use astroport::cosmwasm_ext::{DecimalToInteger, IntegerToDecimal};
 use astroport::observation::{query_observation, try_dec256_into_dec};
 use astroport::pair::{
@@ -27,7 +29,7 @@ use astroport_on_osmosis::pair_pcl::{
 use crate::contract::LP_TOKEN_PRECISION;
 use crate::error::ContractError;
 use crate::state::{BALANCES, CONFIG, OBSERVATIONS};
-use crate::utils::{pool_info, query_native_supply, query_pools};
+use crate::utils::{calculate_tax, pool_info, query_native_supply, query_pools};
 
 /// Exposes all the queries available in the contract.
 ///
@@ -227,7 +229,19 @@ pub fn query_simulation(
     let offer_asset_dec = offer_asset.to_decimal_asset(offer_asset_prec)?;
 
     let pools = query_pools(deps.querier, &env.contract.address, &config, &precisions)?;
+    let tax_config = config
+        .tax_configs
+        .as_ref()
+        .and_then(|configs| configs.get(&offer_asset.info.to_string()));
+    let tax_amount = calculate_tax(
+        &tax_config,
+        offer_asset.to_decimal_asset(offer_asset_prec)?.amount,
+    )?;
 
+    let offer_asset = Asset {
+        amount: offer_asset.amount - tax_amount.to_uint128_with_precision(offer_asset_prec)?,
+        ..offer_asset
+    };
     let (offer_ind, _) = pools
         .iter()
         .find_position(|asset| asset.info == offer_asset.info)
@@ -282,7 +296,15 @@ pub fn query_reverse_simulation(
     let precisions = Precisions::new(deps.storage)?;
     let ask_asset_prec = precisions.get_precision(&ask_asset.info)?;
     let ask_asset_dec = ask_asset.to_decimal_asset(ask_asset_prec)?;
-
+    let tax_config = config
+        .tax_configs
+        .as_ref()
+        .and_then(|configs| configs.get(&ask_asset.info.to_string()));
+    let tax = calculate_tax(&tax_config, ask_asset_dec.amount)?;
+    let ask_asset_dec = DecimalAsset {
+        amount: ask_asset_dec.amount - tax,
+        ..ask_asset_dec
+    };
     let pools = query_pools(deps.querier, &env.contract.address, &config, &precisions)?;
 
     before_swap_check(&pools, ask_asset_dec.amount)?;
